@@ -6,9 +6,10 @@ import Alert from "@material-ui/lab/Alert";
 
 import * as anchor from "@project-serum/anchor";
 
-import { LAMPORTS_PER_SOL } from "@solana/web3.js";
+import {LAMPORTS_PER_SOL, PublicKey} from "@solana/web3.js";
+import {TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID, Token } from "@solana/spl-token";
 
-import { useAnchorWallet } from "@solana/wallet-adapter-react";
+import { useWallet } from "@solana/wallet-adapter-react";
 import { WalletDialogButton } from "@solana/wallet-adapter-material-ui";
 
 import {
@@ -41,10 +42,8 @@ const Home = (props: HomeProps) => {
   const [isActive, setIsActive] = useState(false); // true when countdown completes
   const [isSoldOut, setIsSoldOut] = useState(false); // true when items remaining is zero
   const [isMinting, setIsMinting] = useState(false); // true when user got to press MINT
-
-  const [itemsAvailable, setItemsAvailable] = useState(0);
-  const [itemsRedeemed, setItemsRedeemed] = useState(0);
-  const [itemsRemaining, setItemsRemaining] = useState(0);
+  const [tokenMint, setTokenMint] = useState<PublicKey | undefined>(undefined); // Custom spl token for mint price. Typically undefined
+  const [associatedTokenAccountAddress, setAssociatedTokenAccountAddress] = useState<PublicKey | undefined>(undefined); // Associated token for custom spl mint
 
   const [alertState, setAlertState] = useState<AlertState>({
     open: false,
@@ -54,44 +53,44 @@ const Home = (props: HomeProps) => {
 
   const [startDate, setStartDate] = useState(new Date(props.startDate));
 
-  const wallet = useAnchorWallet();
+  const wallet = useWallet();
   const [candyMachine, setCandyMachine] = useState<CandyMachine>();
 
-  const refreshCandyMachineState = () => {
-    (async () => {
-      if (!wallet) return;
-
-      const {
-        candyMachine,
-        goLiveDate,
-        itemsAvailable,
-        itemsRemaining,
-        itemsRedeemed,
-      } = await getCandyMachineState(
-        wallet as anchor.Wallet,
-        props.candyMachineId,
-        props.connection
-      );
-
-      setItemsAvailable(itemsAvailable);
-      setItemsRemaining(itemsRemaining);
-      setItemsRedeemed(itemsRedeemed);
-
-      setIsSoldOut(itemsRemaining === 0);
-      setStartDate(goLiveDate);
-      setCandyMachine(candyMachine);
-    })();
-  };
+  const updateBalance = async () => {
+    if (wallet?.publicKey) {
+      if (tokenMint && associatedTokenAccountAddress) {
+        const token = new Token(
+            props.connection,
+            tokenMint,
+            TOKEN_PROGRAM_ID,
+            // @ts-ignore
+            wallet
+        )
+        const mintInfo = await token.getMintInfo();
+        try {
+          const associatedTokenAccountInfo = await token.getAccountInfo(associatedTokenAccountAddress);
+          setBalance(associatedTokenAccountInfo.amount.toNumber() / 10 ** mintInfo.decimals);
+        } catch (e) {
+          // if we cant fatch associated address, assume balance is 0
+          setBalance(0);
+        }
+        return;
+      }
+      const balance = await props.connection.getBalance(wallet.publicKey);
+      setBalance(balance / LAMPORTS_PER_SOL);
+    }
+  }
 
   const onMint = async () => {
     try {
       setIsMinting(true);
-      if (wallet && candyMachine?.program) {
+      if (wallet.connected && candyMachine?.program && wallet.publicKey) {
         const mintTxId = await mintOneToken(
           candyMachine,
           props.config,
           wallet.publicKey,
-          props.treasury
+          props.treasury,
+          associatedTokenAccountAddress
         );
 
         const status = await awaitTransactionSignatureConfirmation(
@@ -141,46 +140,73 @@ const Home = (props: HomeProps) => {
         severity: "error",
       });
     } finally {
-      if (wallet) {
-        const balance = await props.connection.getBalance(wallet.publicKey);
-        setBalance(balance / LAMPORTS_PER_SOL);
-      }
+      await updateBalance();
       setIsMinting(false);
-      refreshCandyMachineState();
     }
   };
 
   useEffect(() => {
     (async () => {
-      if (wallet) {
-        const balance = await props.connection.getBalance(wallet.publicKey);
-        setBalance(balance / LAMPORTS_PER_SOL);
-      }
+      await updateBalance();
     })();
-  }, [wallet, props.connection]);
+  }, [wallet, props.connection, tokenMint]);
 
-  useEffect(refreshCandyMachineState, [
-    wallet,
-    props.candyMachineId,
-    props.connection,
-  ]);
+  useEffect(() => {
+    (async () => {
+      if (
+        !wallet ||
+        !wallet.publicKey ||
+        !wallet.signAllTransactions ||
+        !wallet.signTransaction
+      ) {
+        return;
+      }
+
+      const anchorWallet = {
+        publicKey: wallet.publicKey,
+        signAllTransactions: wallet.signAllTransactions,
+        signTransaction: wallet.signTransaction,
+      } as anchor.Wallet;
+
+      const { candyMachine, goLiveDate, itemsRemaining, tokenMint } =
+        await getCandyMachineState(
+          anchorWallet,
+          props.candyMachineId,
+          props.connection
+        );
+
+
+
+      setIsSoldOut(itemsRemaining === 0);
+      setStartDate(goLiveDate);
+
+      if (tokenMint) {
+        const associatedTokenAccountAddress = await Token.getAssociatedTokenAddress(
+            ASSOCIATED_TOKEN_PROGRAM_ID,
+            TOKEN_PROGRAM_ID,
+            tokenMint,
+            wallet.publicKey
+        );
+        setTokenMint(tokenMint);
+        setAssociatedTokenAccountAddress(associatedTokenAccountAddress);
+      }
+
+      setCandyMachine(candyMachine);
+    })();
+  }, [wallet, props.candyMachineId, props.connection]);
 
   return (
     <main>
-      {wallet && (
-        <p>Wallet {shortenAddress(wallet.publicKey.toBase58() || "")}</p>
+      {wallet.connected && (
+        <p>Address: {shortenAddress(wallet.publicKey?.toBase58() || "")}</p>
       )}
 
-      {wallet && <p>Balance: {(balance || 0).toLocaleString()} SOL</p>}
-
-      {wallet && <p>Total Available: {itemsAvailable}</p>}
-
-      {wallet && <p>Redeemed: {itemsRedeemed}</p>}
-
-      {wallet && <p>Remaining: {itemsRemaining}</p>}
+      {wallet.connected && (
+        <p>Balance: {(balance || 0).toLocaleString()} {tokenMint ? "" : "SOL"}</p>
+      )}
 
       <MintContainer>
-        {!wallet ? (
+        {!wallet.connected ? (
           <ConnectButton>Connect Wallet</ConnectButton>
         ) : (
           <MintButton
@@ -233,7 +259,7 @@ interface AlertState {
 const renderCounter = ({ days, hours, minutes, seconds, completed }: any) => {
   return (
     <CounterText>
-      {hours + (days || 0) * 24} hours, {minutes} minutes, {seconds} seconds
+      {hours} hours, {minutes} minutes, {seconds} seconds
     </CounterText>
   );
 };
